@@ -50,9 +50,8 @@ python enrich_localpipe.py            # full run; skips rows already done
 python enrich_waterfall.py --limit 10
 python enrich_waterfall.py
 
-# Exports -> your Downloads folder
+# Export -> your Downloads folder
 python split_results.py               # merged file, all sources
-python export_localpipe_only.py       # LocalPipe-only cut
 ```
 
 **Always run the `--limit` sample first.** Stages 3 and 4 spend credits; the sample shows you the hit rate before you commit to the full list.
@@ -72,9 +71,9 @@ CITIES = [("Austin, TX", 30.2672, -97.7431), ...]   # name, lat, lng
 
 ## Output
 
-Two CSVs land in your Downloads folder. Both sort by tier, then location, then name, and are UTF-8-with-BOM so Excel opens them cleanly.
+One CSV lands in your Downloads folder, sorted by tier, then location, then name, and encoded UTF-8-with-BOM so Excel opens it cleanly.
 
-**`general-contractors-enriched.csv`** — 27 columns, everything merged. Key fields:
+**`general-contractors-enriched.csv`** — 27 columns, every source merged. This schema is fixed: downstream tables map against it, so columns are never added, renamed, or reordered. Key fields:
 
 | Column | Meaning |
 |---|---|
@@ -84,7 +83,7 @@ Two CSVs land in your Downloads folder. Both sort by tier, then location, then n
 | `email_domain_match` | `no` = address is on a different domain than the website — **QA these** |
 | `location_count`, `is_multi_location`, `chain_cities` | chain / franchise detection |
 
-**`general-contractors-localpipe-stage3.csv`** — 31 columns, LocalPipe only, no waterfall data.
+Because `email_source` records which provider supplied each address, this single file already shows what any one stage contributed — filter on it rather than exporting a per-stage file.
 
 ## How chain detection works (free, no API)
 
