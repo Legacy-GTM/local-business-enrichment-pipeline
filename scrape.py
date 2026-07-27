@@ -52,7 +52,13 @@ def log(msg):
 
 def load_env():
     env = {}
-    with open(os.path.join(HERE, ".env"), encoding="utf-8") as f:
+    path = os.path.join(HERE, ".env")
+    if not os.path.exists(path):
+        sys.exit("No .env file found.\n"
+                 "  1. cp .env.example .env\n"
+                 "  2. paste your API keys into .env\n"
+                 "See the README for where to get each key.")
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
