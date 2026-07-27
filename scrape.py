@@ -1,10 +1,21 @@
 """
-Stage 1 + 2: Scrape "general contractors" across 32 US cities via ScraperTech,
-dedup, filter, derive chain/multi-location flags, emit <=500 rows.
+Stage 1 + 2: Scrape local businesses across the configured cities, dedup,
+filter, derive chain/multi-location flags, emit <=TARGET_TOTAL rows.
 
-Run:  python scrape.py
+Two interchangeable scrape providers -- ScraperTech is OPTIONAL:
+
+  python scrape.py                        # ScraperTech if its key is set,
+                                          # otherwise LocalPipe automatically
+  python scrape.py --provider localpipe   # force LocalPipe (one key for
+                                          # the whole pipeline)
+  python scrape.py --provider scrapertech # force ScraperTech
+  python scrape.py --reuse-raw            # rebuild from cache, ZERO API calls
+
+Both providers feed identical columns downstream, so the export schema is the
+same either way. See the README for which to pick.
+
 Out:  raw/<city>.json          one file per city (audit trail)
-      general-contractors.csv  final <=500 rows, enrichment-ready
+      general-contractors.csv  final rows, enrichment-ready
       scrape.log               progress + failures
 """
 import csv, json, os, re, sys, time, urllib.request, urllib.error
@@ -152,13 +163,194 @@ def scrape_city(url, city, lat, lng):
     return city, rows
 
 
+# ---------- stage 1 (alternative provider): LocalPipe /maps-search ----------
+# Lets you run the whole pipeline on ONE key. See README for the tradeoff:
+# LocalPipe bills per LEAD RETURNED here, ScraperTech bills per REQUEST.
+
+LP_API = "https://uunrlffonnvmbsstkpze.supabase.co/functions/v1"
+# Public anon key published in LocalPipe's own docs -- used only for the
+# polling endpoints, which are excluded from rate limits. Not a secret.
+LP_ANON = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6"
+           "InV1bnJsZmZvbm52bWJzc3RrcHplIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTIwMzMs"
+           "ImV4cCI6MjA4NjA2ODAzM30.8Ic_U17YrZtsDVnYnIP0XJzrhZJOLDSlJ0AZfTS31FQ")
+
+STATE_RE = re.compile(r",\s*([A-Z]{2})\b(?:\s+\d{5})?\s*$")
+
+
+def derive_state(full_address):
+    """LocalPipe's maps-search has no `state` field; ScraperTech does. Parse it
+    from the address tail so the export schema stays identical across providers."""
+    if not full_address:
+        return ""
+    m = STATE_RE.search(full_address.strip())
+    return m.group(1) if m else ""
+
+
+def _json_req(url, payload=None, headers=None, timeout=TIMEOUT):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            return e.code, json.loads(body)
+        except Exception:
+            return e.code, body
+
+
+def normalize_localpipe(r):
+    """Map a LocalPipe maps-search row onto the ScraperTech field names the rest
+    of the pipeline already expects."""
+    addr = r.get("full_address") or ""
+    return {
+        "name": r.get("name"),
+        "phone_number": r.get("phone"),          # LocalPipe: `phone`
+        "website": r.get("website"),
+        "full_address": addr,
+        "city": r.get("city"),
+        "state": derive_state(addr),             # not supplied -> derived
+        "latitude": r.get("latitude"),
+        "longitude": r.get("longitude"),
+        "place_id": r.get("place_id"),
+        "business_id": r.get("business_id"),
+        "types": r.get("types") or [],
+        "price_level": r.get("price_level"),
+        "rating": r.get("rating"),
+        "review_count": r.get("review_count"),
+        "is_claimed": r.get("is_claimed"),
+        "verified": None,                        # LocalPipe does not report this
+        # LocalPipe omits closure flags; absent means "not known closed", which
+        # is the safe default -- it only ever costs us a row we could have dropped.
+        "is_permanently_closed": False,
+        "is_temporarily_closed": False,
+        "working_hours": r.get("working_hours"),
+    }
+
+
+def scrape_localpipe(key):
+    """Batch cities <=25 per call (API limit), poll to done, paginate fully.
+
+    Returns [(city_label, [raw_rows]), ...]. LocalPipe answers a batch in ONE
+    response with no per-row attribution back to the input label, so rows are
+    bucketed by the `city` each result reports.
+    """
+    headers = {"Content-Type": "application/json", "x-api-key": key}
+    batches = [CITIES[i:i + 25] for i in range(0, len(CITIES), 25)]
+    log(f"LocalPipe maps-search: {len(CITIES)} cities in {len(batches)} batch(es) "
+        f"(API caps 25 locations x 5 keywords per call)")
+
+    task_ids = []
+    for n, batch in enumerate(batches, 1):
+        payload = {
+            "query": [KEYWORD],
+            "location": [c for c, _, _ in batch],
+            "limit": PER_CITY,
+            # Server-side filter: skips websiteless businesses before they are
+            # billed, which is exactly what we would discard locally anyway.
+            "filters": {"has_website": True},
+        }
+        code, body = _json_req(f"{LP_API}/maps-search", payload, headers)
+        if code in (200, 202) and isinstance(body, dict) and body.get("task_id"):
+            task_ids.append(body["task_id"])
+            log(f"  batch {n}/{len(batches)} accepted: task_id={body['task_id']}")
+        else:
+            log(f"  batch {n}/{len(batches)} FAILED HTTP {code}: {str(body)[:200]}")
+
+    if not task_ids:
+        sys.exit("LocalPipe maps-search accepted no batches -- nothing to scrape.")
+
+    # Poll to terminal, then paginate every page. Never time out: the docs are
+    # explicit that jobs can queue for many minutes and never expire.
+    all_rows = []
+    for task_id in task_ids:
+        while True:
+            code, body = _json_req(
+                f"{LP_API}/get-scrape-results?task_id={task_id}&limit=5000&offset=0",
+                None, {"apikey": LP_ANON})
+            status = (body or {}).get("status") if isinstance(body, dict) else None
+            if status in ("success", "done", "completed"):
+                break
+            if status in ("failed", "error", "cancelled"):
+                log(f"  task {task_id}: {status}")
+                body = None
+                break
+            prog = (body or {}).get("progress") if isinstance(body, dict) else None
+            log(f"  task {task_id}: {status or 'pending'}"
+                + (f" leads={prog.get('leads_found')}" if prog else ""))
+            time.sleep(15)
+        if not body:
+            continue
+
+        offset, page = 0, body
+        while True:
+            rows = page.get("data") or []
+            all_rows.extend(rows)
+            pg = page.get("pagination") or {}
+            if not pg.get("has_more"):
+                break
+            offset = pg.get("next_offset", offset + 5000)
+            _, page = _json_req(
+                f"{LP_API}/get-scrape-results?task_id={task_id}&limit=5000&offset={offset}",
+                None, {"apikey": LP_ANON})
+            if not isinstance(page, dict):
+                break
+        log(f"  task {task_id}: {len(all_rows)} rows accumulated")
+
+    # Bucket by the city each row reports, matched back to our input labels.
+    labels = {c.split(",")[0].strip().lower(): c for c, _, _ in CITIES}
+    buckets = OrderedDict((c, []) for c, _, _ in CITIES)
+    unmatched = []
+    for r in all_rows:
+        row = normalize_localpipe(r)
+        key_city = (row.get("city") or "").split(",")[0].strip().lower()
+        label = labels.get(key_city)
+        if label:
+            buckets[label].append(row)
+        else:
+            unmatched.append(row)
+    if unmatched:
+        # Keep them: a returned city name that doesn't match our label is still
+        # a real business. Park under the first label so nothing is dropped.
+        log(f"  {len(unmatched)} rows whose city didn't match an input label (kept)")
+        buckets[CITIES[0][0]].extend(unmatched)
+
+    os.makedirs(RAW, exist_ok=True)
+    for city, rows in buckets.items():
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", city)
+        with open(os.path.join(RAW, f"{safe}.json"), "w", encoding="utf-8") as f:
+            json.dump(rows, f, indent=1)
+    return list(buckets.items())
+
+
 def main():
     open(LOG, "w").close()
     env = load_env()
-    key = env.get("SCRAPERTECH_KEY")
-    if not key:
-        sys.exit("SCRAPERTECH_KEY missing from .env")
-    url = f"https://mcp.scraper.tech/{key}"
+
+    # Provider selection. ScraperTech is OPTIONAL: with no key, or with
+    # --provider localpipe, the scrape runs on the LocalPipe key alone.
+    provider = "scrapertech"
+    if "--provider" in sys.argv:
+        provider = sys.argv[sys.argv.index("--provider") + 1].lower()
+    elif not env.get("SCRAPERTECH_KEY", "").strip() or \
+            env.get("SCRAPERTECH_KEY", "").startswith("your_"):
+        provider = "localpipe"
+    if provider not in ("scrapertech", "localpipe"):
+        sys.exit(f"Unknown --provider '{provider}'. Use scrapertech or localpipe.")
+
+    url = None
+    if provider == "scrapertech":
+        key = env.get("SCRAPERTECH_KEY", "").strip()
+        if not key or key.startswith("your_"):
+            sys.exit("SCRAPERTECH_KEY missing from .env.\n"
+                     "Either add it, or run with:  python scrape.py --provider localpipe")
+        url = f"https://mcp.scraper.tech/{key}"
+    else:
+        lp = env.get("LOCALPIPE_KEY", "").strip()
+        if not lp or lp.startswith("lp_your_"):
+            sys.exit("LOCALPIPE_KEY missing from .env -- required for --provider localpipe.")
+    log(f"Scrape provider: {provider}")
 
     log(f"Scraping '{KEYWORD}' across {len(CITIES)} cities "
         f"(limit {PER_CITY}/city, {WORKERS} workers)")
@@ -177,6 +369,8 @@ def main():
             else:
                 log(f"  MISS  {city}: no cached file")
                 results.append((city, []))
+    elif provider == "localpipe":
+        results = scrape_localpipe(env["LOCALPIPE_KEY"].strip())
     else:
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             futures = [ex.submit(scrape_city, url, c, la, ln) for c, la, ln in CITIES]

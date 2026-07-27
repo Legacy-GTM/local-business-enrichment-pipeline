@@ -33,13 +33,51 @@ cp .env.example .env      # then paste your own keys into .env
 
 Requires **Python 3.8+**. Nothing else — no dependencies.
 
-You need at minimum a ScraperTech key and a LocalPipe key. AI Ark and Prospeo are optional; without them stage 4 is skipped and rows stay in the "no email" tier.
+**You only strictly need one key: LocalPipe.** Everything else is optional.
+
+| Key | Required? | Without it |
+|---|---|---|
+| `LOCALPIPE_KEY` | **yes** | nothing runs |
+| `SCRAPERTECH_KEY` | no | scraping falls back to LocalPipe automatically |
+| `AIARK_KEY` | no | stage 4a is skipped |
+| `PROSPEO_KEY` | no | stage 4b is skipped |
+
+## Do I need ScraperTech?
+
+**No.** LocalPipe has its own Google Maps scraper, so a single LocalPipe key runs the entire pipeline:
+
+```bash
+python scrape.py --provider localpipe
+```
+
+Leave `SCRAPERTECH_KEY` blank and the pipeline picks LocalPipe on its own — no flag needed. Both providers feed **identical columns** downstream, so your export schema is the same either way.
+
+**So why does this repo use ScraperTech by default?** One reason: **cost at scale.**
+
+| | ScraperTech | LocalPipe `/maps-search` |
+|---|---|---|
+| **Billing** | per **request** | per **lead returned** |
+| Real example | 32 requests → 800 businesses | 800 businesses → 800 leads billed |
+| Speed | synchronous, seconds | async: submit → poll, minutes |
+| Batching | 1 city per request | up to 5 keywords × 25 cities per request |
+| Server-side filters | none (filter locally) | `has_website`, `min_rating`, etc. |
+| Extra fields | `state`, `verified`, closed flags | — (`state` is derived from the address) |
+| Keys to manage | a second one | none, you already have it |
+
+**Use ScraperTech when** you scrape large volumes, re-run often, or want the scrape to not consume the same credit pool your enrichment needs — its per-request billing makes big scrapes dramatically cheaper, and it returns closed-business flags that save you enriching dead listings.
+
+**Skip ScraperTech when** your scope is small or one-off, you'd rather manage a single key and a single bill, or you want LocalPipe's server-side `has_website` filter to avoid paying for businesses you'd discard anyway.
+
+For a few hundred leads the difference is minor — **just use LocalPipe.** The second key starts paying for itself in the thousands.
+
+⚠️ **LocalPipe's `limit` is approximate — budget for overshoot.** In testing, `limit: 5` on one city returned **50** businesses, all of them billed. Treat `PER_CITY` as a hint, not a ceiling, and start small when you're calibrating spend. ScraperTech's `limit` behaves as a true ceiling by comparison.
 
 ## Usage
 
 ```bash
-# Stage 1+2 -- scrape and flag chains  (~32 API requests)
-python scrape.py
+# Stage 1+2 -- scrape and flag chains
+python scrape.py                      # auto-picks provider from your keys
+python scrape.py --provider localpipe # force LocalPipe (one key, no ScraperTech)
 python scrape.py --reuse-raw          # rebuild from cache, ZERO API calls
 
 # Stage 3 -- owner name + email
