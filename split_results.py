@@ -12,16 +12,26 @@ result_tier, in file order:
 
 email_source: localpipe_owner | localpipe_business | aiark | prospeo
 """
-import csv, os
+import csv, os, sys
 from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
-OUT = os.path.join(DOWNLOADS, "general-contractors-enriched.csv")
+# Region selection mirrors scrape.py; US filenames stay unsuffixed.
+PREFIXES = {"us": "general-contractors", "ca": "general-contractors-canada"}
+REGION = "us"
+if "--region" in sys.argv:
+    REGION = sys.argv[sys.argv.index("--region") + 1].lower()
+if REGION not in PREFIXES:
+    sys.exit(f"Unknown --region '{REGION}'. Available: {', '.join(PREFIXES)}")
+PREFIX = PREFIXES[REGION]
+SUF = "" if REGION == "us" else f"-{REGION}"
 
-SRC_LIST = os.path.join(HERE, "general-contractors.csv")
-SRC_LP = os.path.join(HERE, "localpipe_results.csv")
-SRC_WF = os.path.join(HERE, "waterfall_results.csv")
+OUT = os.path.join(DOWNLOADS, f"{PREFIX}-enriched.csv")
+
+SRC_LIST = os.path.join(HERE, f"{PREFIX}.csv")
+SRC_LP = os.path.join(HERE, f"localpipe_results{SUF}.csv")
+SRC_WF = os.path.join(HERE, f"waterfall_results{SUF}.csv")
 
 # A business whose "website" is a shared host (facebook.com, sites.google.com,
 # instagram.com...) must NEVER be used as a company-domain lookup key: AI Ark and

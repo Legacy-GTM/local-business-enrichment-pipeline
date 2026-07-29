@@ -77,6 +77,7 @@ For a few hundred leads the difference is minor — **just use LocalPipe.** The 
 ```bash
 # Stage 1+2 -- scrape and flag chains
 python scrape.py                      # auto-picks provider from your keys
+python scrape.py --region ca          # Canada instead of the US
 python scrape.py --provider localpipe # force LocalPipe (one key, no ScraperTech)
 python scrape.py --reuse-raw          # rebuild from cache, ZERO API calls
 
@@ -93,6 +94,27 @@ python split_results.py               # merged file, all sources
 ```
 
 **Always run the `--limit` sample first.** Stages 3 and 4 spend credits; the sample shows you the hit rate before you commit to the full list.
+
+## Regions
+
+`--region us` (default) and `--region ca` are built in, each with 32 metros. **Pass the same `--region` to every stage** — it selects the city list, the `country` sent to the API, the output filename, and the `raw/` cache:
+
+```bash
+python scrape.py            --region ca
+python enrich_localpipe.py  --region ca
+python enrich_waterfall.py  --region ca
+python split_results.py     --region ca      # -> general-contractors-canada-enriched.csv
+```
+
+US filenames are unsuffixed, every other region gets a suffix, so regions never overwrite each other and each keeps its own cache.
+
+Two things that bite when scraping outside the US:
+
+- **`country` is not optional.** Without it, "London, ON" happily returns London, **UK**.
+- **Border cities leak across.** A Windsor, ON search returned 6 **Detroit, MI** businesses — the lat/lng radius crosses the river. Rows resolving to a province/state outside the region are dropped automatically and the count is logged. Rows with no resolvable location are *kept*, since being unprovable isn't the same as being foreign.
+- **Provinces aren't always 2-letter codes.** Quebec listings say `"Montreal, Quebec"`, and ScraperTech returns `state: null` for Canada entirely, putting the province in `city`. `resolve_state()` handles all three shapes; without it the whole column came back empty.
+
+Adding a region: append a `CITIES_XX` list and a `REGIONS` entry (with its `valid_states` set) in `scrape.py`, and add the prefix to `PREFIXES` in the other three scripts.
 
 ## Configuring your search
 

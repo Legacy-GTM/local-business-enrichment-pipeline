@@ -23,8 +23,6 @@ from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-RAW = os.path.join(HERE, "raw")
-LOG = os.path.join(HERE, "scrape.log")
 
 KEYWORD      = "general contractors"
 TARGET_TOTAL = 500     # hard cap on final rows
@@ -34,7 +32,7 @@ TIMEOUT      = 300
 
 # Longitudes below are WEST -> stored NEGATIVE. Getting this wrong silently
 # scrapes the wrong hemisphere and returns plausible-looking garbage.
-CITIES = [
+CITIES_US = [
     ("New York City, NY",     40.7143, -74.0060), ("Los Angeles, CA",   34.0522, -118.2437),
     ("Brooklyn, NY",          40.6501, -73.9496), ("Chicago, IL",       41.8500, -87.6500),
     ("Queens, NY",            40.6815, -73.8365), ("Houston, TX",       29.7633, -95.3633),
@@ -52,6 +50,42 @@ CITIES = [
     ("Portland, OR",          45.5234, -122.6762),("Detroit, MI",       42.3314, -83.0457),
     ("Las Vegas, NV",         36.1750, -115.1372),("New South Memphis, TN", 35.0868, -90.0568),
 ]
+
+# All of Canada is west of Greenwich, so every longitude here is negative too.
+CITIES_CA = [
+    ("Toronto, ON",           43.6532, -79.3832), ("Montreal, QC",       45.5017, -73.5673),
+    ("Vancouver, BC",         49.2827, -123.1207),("Calgary, AB",        51.0447, -114.0719),
+    ("Edmonton, AB",          53.5461, -113.4938),("Ottawa, ON",         45.4215, -75.6972),
+    ("Mississauga, ON",       43.5890, -79.6441), ("Winnipeg, MB",       49.8951, -97.1384),
+    ("Quebec City, QC",       46.8139, -71.2080), ("Hamilton, ON",       43.2557, -79.8711),
+    ("Brampton, ON",          43.7315, -79.7624), ("Surrey, BC",         49.1913, -122.8490),
+    ("Kitchener, ON",         43.4516, -80.4925), ("Halifax, NS",        44.6488, -63.5752),
+    ("Laval, QC",             45.6066, -73.7124), ("London, ON",         42.9849, -81.2453),
+    ("Markham, ON",           43.8561, -79.3370), ("Vaughan, ON",        43.8361, -79.4983),
+    ("Gatineau, QC",          45.4765, -75.7013), ("Saskatoon, SK",      52.1332, -106.6700),
+    ("Longueuil, QC",         45.5312, -73.5185), ("Burnaby, BC",        49.2488, -122.9805),
+    ("Regina, SK",            50.4452, -104.6189),("Richmond, BC",       49.1666, -123.1336),
+    ("Richmond Hill, ON",     43.8828, -79.4403), ("Oakville, ON",       43.4675, -79.6877),
+    ("Burlington, ON",        43.3255, -79.7990), ("Oshawa, ON",         43.8971, -78.8658),
+    ("Windsor, ON",           42.3149, -83.0364), ("St. Catharines, ON", 43.1594, -79.2469),
+    ("Victoria, BC",          48.4284, -123.3656),("Barrie, ON",         44.3894, -79.6903),
+]
+
+# Each region gets its own output filename and raw/ cache. Sharing either would
+# let one region silently overwrite the other's export.
+REGIONS = {
+    "us": {"cities": CITIES_US, "country": "us", "prefix": "general-contractors"},
+    "ca": {"cities": CITIES_CA, "country": "ca", "prefix": "general-contractors-canada"},
+}
+# Populated after the state tables are defined, below.
+
+# Rebound by main() from --region. Defaults keep the original US behaviour.
+REGION = "us"
+CITIES = CITIES_US
+COUNTRY = "us"
+OUT_PREFIX = "general-contractors"
+RAW = os.path.join(HERE, "raw", "us")
+LOG = os.path.join(HERE, "scrape-us.log")
 
 
 def log(msg):
@@ -144,7 +178,8 @@ def scrape_city(url, city, lat, lng):
         data = mcp_call(url, "search_maps", {
             "query": KEYWORD,
             "lat": str(lat), "lng": str(lng),
-            "limit": str(PER_CITY), "country": "us", "lang": "en",
+            # country matters: without it "London, ON" can resolve to London, UK.
+            "limit": str(PER_CITY), "country": COUNTRY, "lang": "en",
         })
     except Exception as e:                      # network / MCP / parse failure
         log(f"  FAIL  {city}: {type(e).__name__}: {e}")
@@ -174,16 +209,94 @@ LP_ANON = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI
            "InV1bnJsZmZvbm52bWJzc3RrcHplIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTIwMzMs"
            "ImV4cCI6MjA4NjA2ODAzM30.8Ic_U17YrZtsDVnYnIP0XJzrhZJOLDSlJ0AZfTS31FQ")
 
-STATE_RE = re.compile(r",\s*([A-Z]{2})\b(?:\s+\d{5})?\s*$")
+# Matches the state/province code at the end of an address, tolerating either a
+# US ZIP ("TX 78753", "TX 78753-1234") or a Canadian postal code
+# ("ON M5V 2A1", "ON M5V2A1"), plus an optional trailing country name.
+STATE_RE = re.compile(
+    r",\s*([A-Z]{2})\b"
+    r"(?:\s+(?:\d{5}(?:-\d{4})?|[A-Z]\d[A-Z]\s?\d[A-Z]\d))?"
+    r"\s*(?:,\s*(?:Canada|USA|United States|US))?\s*$"
+)
 
 
 def derive_state(full_address):
     """LocalPipe's maps-search has no `state` field; ScraperTech does. Parse it
-    from the address tail so the export schema stays identical across providers."""
+    from the address tail so the export schema stays identical across providers.
+    Handles US states and Canadian provinces."""
     if not full_address:
         return ""
     m = STATE_RE.search(full_address.strip())
     return m.group(1) if m else ""
+
+
+CITY_STATE_RE = re.compile(r",\s*([A-Z]{2})\s*$")
+
+# Quebec listings spell the province out ("Montreal, Quebec"), which no
+# two-letter regex will catch -- that alone left 49 rows with a blank province.
+FULL_NAMES = {
+    # Canada
+    "ontario": "ON", "quebec": "QC", "québec": "QC", "british columbia": "BC",
+    "alberta": "AB", "manitoba": "MB", "saskatchewan": "SK", "nova scotia": "NS",
+    "new brunswick": "NB", "newfoundland and labrador": "NL", "newfoundland": "NL",
+    "prince edward island": "PE", "yukon": "YT", "northwest territories": "NT",
+    "nunavut": "NU",
+    # US
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI",
+    "south carolina": "SC", "south dakota": "SD", "tennessee": "TN", "texas": "TX",
+    "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+    "district of columbia": "DC", "washington dc": "DC",
+}
+
+CA_STATES = {"ON", "QC", "BC", "AB", "MB", "SK", "NS", "NB", "NL", "PE",
+             "YT", "NT", "NU"}
+US_STATES = set(FULL_NAMES.values()) - CA_STATES
+
+# Border cities leak: a Windsor, ON search returned 6 Detroit, MI businesses
+# because the lat/lng radius crosses the river. Rows resolving to a province or
+# state outside the region are dropped. Blanks are KEPT -- we cannot prove those
+# are foreign, and discarding them would silently lose real businesses.
+REGIONS["us"]["valid_states"] = US_STATES
+REGIONS["ca"]["valid_states"] = CA_STATES
+
+
+def _tail_full_name(text):
+    """Map a spelled-out province/state at the end of a string to its code."""
+    if not text:
+        return ""
+    tail = text.strip().rstrip(".").split(",")[-1].strip().lower()
+    return FULL_NAMES.get(tail, "")
+
+
+def resolve_state(row):
+    """Fill the `state` column whatever the provider gives us.
+
+    ScraperTech populates `state` for US rows but returns null for Canadian ones,
+    where the province instead rides along in `city` ("Toronto, ON"). Without
+    this fallback the whole column came back empty for Canada, and `state` is
+    part of the locked export schema.
+    """
+    s = (row.get("state") or "").strip()
+    if s:
+        return FULL_NAMES.get(s.lower(), s)
+    addr, city = row.get("full_address") or "", row.get("city") or ""
+    s = derive_state(addr)
+    if s:
+        return s
+    m = CITY_STATE_RE.search(city.strip())
+    if m:
+        return m.group(1)
+    # Spelled-out province, e.g. "Montreal, Quebec"
+    return _tail_full_name(city) or _tail_full_name(addr)
 
 
 def _json_req(url, payload=None, headers=None, timeout=TIMEOUT):
@@ -325,7 +438,18 @@ def scrape_localpipe(key):
 
 
 def main():
+    global REGION, CITIES, COUNTRY, OUT_PREFIX, RAW, LOG
+    if "--region" in sys.argv:
+        REGION = sys.argv[sys.argv.index("--region") + 1].lower()
+    if REGION not in REGIONS:
+        sys.exit(f"Unknown --region '{REGION}'. Available: {', '.join(REGIONS)}")
+    cfg = REGIONS[REGION]
+    CITIES, COUNTRY, OUT_PREFIX = cfg["cities"], cfg["country"], cfg["prefix"]
+    RAW = os.path.join(HERE, "raw", REGION)
+    LOG = os.path.join(HERE, f"scrape-{REGION}.log")
+
     open(LOG, "w").close()
+    log(f"Region: {REGION.upper()}  ({len(CITIES)} cities, country={COUNTRY})")
     env = load_env()
 
     # Provider selection. ScraperTech is OPTIONAL: with no key, or with
@@ -403,8 +527,10 @@ def main():
     deduped = sum(len(v) for v in by_city.values())
     log(f"After place_id dedup: {deduped}  (removed {dupes} dupes/blank ids)")
 
-    # ---------- filter: closed businesses and rows with no website ----------
-    dropped_closed = dropped_nosite = 0
+    # ---------- filter: closed, websiteless, and out-of-region rows ----------
+    valid_states = REGIONS[REGION]["valid_states"]
+    dropped_closed = dropped_nosite = dropped_foreign = 0
+    foreign_examples = []
     for city, rows in by_city.items():
         keep = []
         for r in rows:
@@ -414,11 +540,20 @@ def main():
             if not root_domain(r.get("website")):
                 dropped_nosite += 1
                 continue
+            st = resolve_state(r)
+            if st and st not in valid_states:
+                dropped_foreign += 1
+                if len(foreign_examples) < 4:
+                    foreign_examples.append(f"{(r.get('name') or '')[:28]} [{st}]")
+                continue
             keep.append(r)
         by_city[city] = keep
     filtered = sum(len(v) for v in by_city.values())
     log(f"After filter: {filtered}  (dropped {dropped_closed} closed, "
-        f"{dropped_nosite} without a usable website)")
+        f"{dropped_nosite} without a usable website, "
+        f"{dropped_foreign} outside {REGION.upper()})")
+    if foreign_examples:
+        log(f"  out-of-region examples: {', '.join(foreign_examples)}")
 
     # ---------- stage 2: chain flags, computed on the FULL filtered set ----------
     # Done BEFORE truncation so location counts use every location we saw,
@@ -461,7 +596,7 @@ def main():
     log(f"Final rows after round-robin cap: {len(final)}")
 
     # ---------- write CSV ----------
-    out = os.path.join(HERE, "general-contractors.csv")
+    out = os.path.join(HERE, f"{OUT_PREFIX}.csv")
     cols = ["business_name", "business_location", "business_website", "domain",
             "phone", "full_address", "city", "state", "rating", "review_count",
             "types", "is_claimed", "verified", "location_count", "is_multi_location",
@@ -478,7 +613,7 @@ def main():
                 "phone": r.get("phone_number") or "",
                 "full_address": r.get("full_address") or "",
                 "city": r.get("city") or "",
-                "state": r.get("state") or "",
+                "state": resolve_state(r),
                 "rating": r.get("rating") if r.get("rating") is not None else "",
                 "review_count": r.get("review_count") if r.get("review_count") is not None else "",
                 "types": "; ".join(r.get("types") or []),

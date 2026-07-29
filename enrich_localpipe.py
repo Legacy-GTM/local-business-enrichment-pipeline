@@ -20,11 +20,22 @@ ANON = ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6"
         "InV1bnJsZmZvbm52bWJzc3RrcHplIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0OTIwMzMs"
         "ImV4cCI6MjA4NjA2ODAzM30.8Ic_U17YrZtsDVnYnIP0XJzrhZJOLDSlJ0AZfTS31FQ")
 
-IN_CSV   = os.path.join(HERE, "general-contractors.csv")
-JOBS     = os.path.join(HERE, "localpipe_jobs.json")
-JOBS_JSONL = os.path.join(HERE, "localpipe_jobs.jsonl")  # append-on-submit
-OUT_CSV  = os.path.join(HERE, "localpipe_results.csv")
-LOG      = os.path.join(HERE, "localpipe.log")
+# Region selection mirrors scrape.py. US filenames stay unsuffixed so existing
+# US data keeps working; other regions get a suffix and never collide with it.
+PREFIXES = {"us": "general-contractors", "ca": "general-contractors-canada"}
+REGION = "us"
+if "--region" in sys.argv:
+    REGION = sys.argv[sys.argv.index("--region") + 1].lower()
+if REGION not in PREFIXES:
+    sys.exit(f"Unknown --region '{REGION}'. Available: {', '.join(PREFIXES)}")
+PREFIX = PREFIXES[REGION]
+SUF = "" if REGION == "us" else f"-{REGION}"
+
+IN_CSV   = os.path.join(HERE, f"{PREFIX}.csv")
+JOBS     = os.path.join(HERE, f"localpipe_jobs{SUF}.json")
+JOBS_JSONL = os.path.join(HERE, f"localpipe_jobs{SUF}.jsonl")  # append-on-submit
+OUT_CSV  = os.path.join(HERE, f"localpipe_results{SUF}.csv")
+LOG      = os.path.join(HERE, f"localpipe{SUF}.log")
 
 CONCURRENCY = 8         # submissions. 20 triggered RemoteDisconnected; 8 is proven
 MIN_INTERVAL = 0.14     # ~430/min, under the 500/min ceiling

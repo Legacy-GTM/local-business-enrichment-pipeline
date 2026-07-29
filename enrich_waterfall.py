@@ -29,11 +29,21 @@ PROSPEO = "https://api.prospeo.io"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/125.0 Safari/537.36")
 
-IN_CSV = os.path.join(HERE, "general-contractors.csv")
-LP_CSV = os.path.join(HERE, "localpipe_results.csv")
-PROG = os.path.join(HERE, "waterfall_progress.jsonl")
-OUT_CSV = os.path.join(HERE, "waterfall_results.csv")
-LOG = os.path.join(HERE, "waterfall.log")
+# Region selection mirrors scrape.py; US filenames stay unsuffixed.
+PREFIXES = {"us": "general-contractors", "ca": "general-contractors-canada"}
+REGION = "us"
+if "--region" in sys.argv:
+    REGION = sys.argv[sys.argv.index("--region") + 1].lower()
+if REGION not in PREFIXES:
+    sys.exit(f"Unknown --region '{REGION}'. Available: {', '.join(PREFIXES)}")
+PREFIX = PREFIXES[REGION]
+SUF = "" if REGION == "us" else f"-{REGION}"
+
+IN_CSV = os.path.join(HERE, f"{PREFIX}.csv")
+LP_CSV = os.path.join(HERE, f"localpipe_results{SUF}.csv")
+PROG = os.path.join(HERE, f"waterfall_progress{SUF}.jsonl")
+OUT_CSV = os.path.join(HERE, f"waterfall_results{SUF}.csv")
+LOG = os.path.join(HERE, f"waterfall{SUF}.log")
 
 CONCURRENCY = 4        # AI Ark allows 5 req/s, 300/min -- stay under
 MIN_INTERVAL = 0.25
