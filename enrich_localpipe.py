@@ -46,9 +46,22 @@ _lock = threading.Lock()
 _last = [0.0]
 
 
+# Business names contain emoji (a Canadian contractor had U+1F477). On Windows
+# the console is cp1252 and print() raises UnicodeEncodeError, which previously
+# killed a run mid-poll. Force UTF-8 where supported, and never let logging
+# raise regardless.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
 def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "replace").decode("ascii"), flush=True)
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 

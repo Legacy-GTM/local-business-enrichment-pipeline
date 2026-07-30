@@ -88,9 +88,21 @@ RAW = os.path.join(HERE, "raw", "us")
 LOG = os.path.join(HERE, "scrape-us.log")
 
 
+# Business names contain emoji; on Windows the console is cp1252 and print()
+# raises UnicodeEncodeError. Force UTF-8 where supported and never let logging
+# raise.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
 def log(msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "replace").decode("ascii"), flush=True)
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
