@@ -223,6 +223,31 @@ def main():
                 if r.get("lp_status") == "completed":
                     prior[r["place_id"]] = r
     todo = [r for r in rows if r["place_id"] not in prior]
+
+    # Franchises and multi-branch firms share one website, and LocalPipe keyed on
+    # that website mostly returns the same person for every branch -- measured:
+    # 109 locations on shared domains produced only 43 distinct results, so 66
+    # enrichments were paid for twice. Enrich one branch per domain and fan the
+    # answer out to its siblings. --no-dedupe-domains restores per-branch
+    # enrichment when you specifically want each local franchisee.
+    siblings = {}
+    if "--no-dedupe-domains" not in sys.argv:
+        seen_dom, kept = {}, []
+        for r in todo:
+            dom = (r.get("domain") or "").strip().lower()
+            if not dom:
+                kept.append(r)
+                continue
+            if dom in seen_dom:
+                siblings.setdefault(seen_dom[dom], []).append(r["place_id"])
+                continue
+            seen_dom[dom] = r["place_id"]
+            kept.append(r)
+        skipped = len(todo) - len(kept)
+        if skipped:
+            log(f"Domain dedupe: {skipped} extra branch(es) sharing a domain will "
+                f"reuse their sibling's result instead of being enriched again")
+        todo = kept
     log(f"Enriching {len(rows)} businesses via LocalPipe (concurrency {CONCURRENCY})")
     if prior:
         log(f"Resume: {len(prior)} already completed, submitting {len(todo)} new")
@@ -308,11 +333,32 @@ def main():
     with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
+        # Map each skipped sibling back to the branch that was actually enriched.
+        fan = {sib: src for src, sibs in siblings.items() for sib in sibs}
         for r in rows:
             pid = r["place_id"]
             if pid in prior and pid not in out:
                 w.writerow({c: prior[pid].get(c, "") for c in cols})
                 continue
+            if pid in fan and pid not in out:
+                src = out.get(fan[pid], {})
+                rec = src.get("rec", {})
+                if rec:
+                    w.writerow({
+                        "place_id": pid,
+                        "business_name": r["business_name"],
+                        "business_website": r["business_website"],
+                        "business_location": r["business_location"],
+                        "owner_name": clean(rec.get("owner_name")),
+                        "owner_first_name": clean(rec.get("owner_first_name")),
+                        "owner_last_name": clean(rec.get("owner_last_name")),
+                        "owner_email": clean(rec.get("owner_email")),
+                        "business_email": clean(rec.get("business_email")),
+                        "email_provider": clean(rec.get("email_provider")),
+                        "owner_role": clean(rec.get("owner_role")),
+                        "lp_status": "completed_fanned",
+                    })
+                    continue
             e = out.get(pid, {})
             rec = e.get("rec", {})
             w.writerow({

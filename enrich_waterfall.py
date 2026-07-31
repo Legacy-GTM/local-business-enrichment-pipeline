@@ -127,6 +127,17 @@ def req(url, headers, payload=None, method="POST", timeout=90, attempt=0):
         return 0, {"_net_error": f"{type(e).__name__}: {e}"}
 
 
+# Hosts where many unrelated businesses share one registrable domain. A lookup
+# keyed on these returns employees of the HOST, so it can only ever be wrong --
+# skip before spending a credit.
+SHARED_HOSTS = {
+    "facebook.com", "m.facebook.com", "sites.google.com", "google.com",
+    "business.site", "wixsite.com", "wix.com", "godaddysites.com", "weebly.com",
+    "squarespace.com", "blogspot.com", "wordpress.com", "myshopify.com",
+    "linktr.ee", "yelp.com", "instagram.com", "nextdoor.com", "angi.com",
+    "houzz.com", "thumbtack.com",
+}
+
 MAX_CONTACTS = 3
 
 # Decision-maker titles, in priority order. COO is wanted; CFO/CTO are not.
@@ -336,19 +347,38 @@ def main():
                     except Exception:
                         continue
 
-    targets = []
+    targets, skipped_host, skipped_dupe = [], 0, 0
+    seen_domains = {}
     for b in biz:
         e = lp.get(b["place_id"], {})
         if (e.get("owner_email") or "").strip() or (e.get("business_email") or "").strip():
             continue                      # LocalPipe already delivered
         if b["place_id"] in done:
             continue                      # already processed by a previous run
+        dom = (b.get("domain") or "").strip().lower()
+        # A shared host resolves to employees of the HOST, so the lookup is
+        # guaranteed useless -- and it was being paid for, then discarded at
+        # export. Skip before spending.
+        if not dom or dom in SHARED_HOSTS:
+            skipped_host += 1
+            continue
+        # AI Ark and Prospeo key on DOMAIN alone, so every extra location of a
+        # franchise returns the same people. 16 Alair Homes storefronts cost 16
+        # lookups for one answer. Enrich one per domain and fan the result out.
+        if dom in seen_domains:
+            seen_domains[dom].append(b["place_id"])
+            skipped_dupe += 1
+            continue
+        seen_domains[dom] = []
         targets.append(b)
     if limit:
         targets = targets[:limit]
 
     log(f"Waterfall targets: {len(targets)} "
         f"({len(done)} already processed, concurrency {CONCURRENCY})")
+    if skipped_dupe or skipped_host:
+        log(f"  skipped before spending: {skipped_dupe} extra locations sharing a "
+            f"domain, {skipped_host} on a shared host / no domain")
 
     counter = [0]
 
@@ -427,6 +457,24 @@ def main():
             "contact_name", "contact_title", "contact_title_label",
             "contact_linkedin", "contact_email", "contact_source",
             "aiark_people", "lp_owner_name"]
+    # Fan the result of each domain lookup back out to the sibling locations we
+    # deliberately skipped, so a 16-branch franchise still gets contacts on all
+    # 16 rows while only one lookup was paid for.
+    by_pid = {b["place_id"]: b for b in biz}
+    fanned = 0
+    for r in list(recs):
+        dom = (r.get("domain") or "").strip().lower()
+        for sib in seen_domains.get(dom, []):
+            b = by_pid.get(sib)
+            if not b:
+                continue
+            recs.append({**r, "place_id": sib,
+                         "business_name": b.get("business_name", ""),
+                         "fanned_from": r.get("place_id")})
+            fanned += 1
+    if fanned:
+        log(f"  fanned {fanned} sibling location(s) from an already-paid lookup")
+
     flat = []
     for r in recs:
         cs = r.get("contacts") or []
