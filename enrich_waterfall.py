@@ -20,7 +20,8 @@ Out:  waterfall_progress.jsonl   appended per row, resume-safe
       waterfall_results.csv      parsed results
       waterfall.log
 """
-import csv, json, os, sys, threading, time, urllib.request, urllib.error
+import csv, json, os, re, sys, threading, time, urllib.request, urllib.error
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -126,52 +127,138 @@ def req(url, headers, payload=None, method="POST", timeout=90, attempt=0):
         return 0, {"_net_error": f"{type(e).__name__}: {e}"}
 
 
-def rank_person(p):
-    sen = ((p.get("department") or {}).get("seniority") or "").lower()
-    try:
-        return SENIORITY_RANK.index(sen)
-    except ValueError:
-        return len(SENIORITY_RANK)
+MAX_CONTACTS = 3
+
+# Decision-maker titles, in priority order. COO is wanted; CFO/CTO are not.
+TITLE_RANK = [
+    (re.compile(r"\b(chief\s+executive\s+officer|c\.?e\.?o\.?)\b", re.I), "CEO"),
+    (re.compile(r"\b(co[-\s]?founder|founder|founding\s+partner)\b", re.I), "Founder"),
+    (re.compile(r"\b(co[-\s]?owner|owner|proprietor)\b", re.I), "Owner"),
+    (re.compile(r"\bpresident\b", re.I), "President"),
+    (re.compile(r"\b(chief\s+operating\s+officer|c\.?o\.?o\.?)\b", re.I), "COO"),
+    (re.compile(r"\bmanaging\s+(director|partner)\b", re.I), "Managing Director"),
+    (re.compile(r"\bexecutive\s+director\b", re.I), "Executive Director"),
+    (re.compile(r"\bprincipal\b", re.I), "Principal"),
+    (re.compile(r"\bpartner\b", re.I), "Partner"),
+    (re.compile(r"\b(chairman|chairwoman|chairperson|chair\s+of\s+the\s+board)\b", re.I), "Chairman"),
+    (re.compile(r"\bboard\s+(member|director)\b|\bdirector\s*,?\s*board\b", re.I), "Board Member"),
+    (re.compile(r"\b(investor|shareholder|stakeholder|backer)\b", re.I), "Investor"),
+]
+
+# Checked FIRST, because several non-matches look like matches until it runs:
+# "Partner Intelligence Manager" (a manager), "Chief Financial Officer,
+# Executive Vice President" (CFO), "Board Member" (not an operator).
+TITLE_EXCLUDE = re.compile(
+    r"\b(cfo|cto|cmo|cio|cro|chro|ciso)\b"
+    r"|chief\s+(financial|technolog\w*|marketing|information|revenue|people|"
+    r"human|legal|security|data|product|compliance|strategy|innovation|"
+    r"administrative|accounting|nursing|medical)\b"
+    r"|\b(vice\s+president|vp|svp|evp|avp)\b"
+    r"|\b(manager|coordinator|specialist|estimator|foreman|superintendent|"
+    r"supervisor|analyst|assistant|associate|intern|apprentice|engineer|"
+    r"architect|accountant|administrator|recruiter|labou?rer|carpenter|"
+    r"technician|representative|consultant|advis[eo]r|clerk|receptionist|"
+    r"bookkeeper|scheduler|planner|buyer|drafter|designer)\b"
+    r"|\bdirector\s+of\b|\bdeputy\b|\binterim\b",
+    re.I)
+
+# Seniority buckets to ask AI Ark for. On a 4,000-employee firm an UNFILTERED
+# search returns superintendents and recruiters, never the CEO -- so filtering
+# is required, not optional. The unfiltered pass is only a fallback for small
+# firms whose owner is not seniority-tagged.
+AIARK_SENIORITY = ["c_suite", "founder", "owner", "partner", "president",
+                   "executive", "chief_executive_officer"]
 
 
-def aiark_lookup(domain, H):
-    """Search people at this domain, pick the most senior, fetch their email."""
-    code, d = req(f"{AIARK}/v1/people", H,
-                  {"account": {"domain": {"any": {"include": [domain]}}},
-                   "page": 0, "size": 5})
-    if code != 200 or not isinstance(d, dict):
-        return {"aiark_error": f"search HTTP {code}"}
-    people = d.get("content") or []
+def classify_title(title):
+    """(rank, label) if this title can make a buying decision, else None."""
+    if not title:
+        return None
+    t = title.strip()
+    if TITLE_EXCLUDE.search(t):
+        return None
+    for i, (rx, label) in enumerate(TITLE_RANK):
+        if rx.search(t):
+            return i, label
+    return None
+
+
+def person_title(p):
+    """AI Ark hides the job title in position_groups[].profile_positions[].title
+    -- `headline` comes back null."""
+    for g in (p.get("position_groups") or []):
+        for pos in (g.get("profile_positions") or []):
+            if pos.get("title"):
+                return pos["title"]
+    return ""
+
+
+def aiark_email_for(person_id, H):
+    """Fetch one person's email. 1 credit, charged only when found."""
+    code, e = req(f"{AIARK}/v2/people/export/single", H, {"id": person_id})
+    if code != 200 or not isinstance(e, dict):
+        return ""
+    data = e.get("data") or e
+    em = data.get("email") or {}
+    addr = em.get("value") or em.get("address") or ""
+    if not addr:
+        outp = em.get("output") or []
+        if outp and isinstance(outp, list):
+            addr = (outp[0] or {}).get("address", "")
+    return addr or ""
+
+
+def aiark_contacts(domain, H, want=MAX_CONTACTS):
+    """Up to `want` decision-makers at this domain, most senior first.
+
+    Two passes. The seniority-filtered pass is the important one: on a
+    4,000-employee firm an unfiltered search returns superintendents and
+    recruiters and never the CEO. The unfiltered pass only exists to catch small
+    firms whose owner is present but not seniority-tagged.
+    """
+    people, total = [], 0
+    for body in (
+        {"account": {"domain": {"any": {"include": [domain]}}},
+         "contact": {"seniority": {"any": {"include": AIARK_SENIORITY}}},
+         "page": 0, "size": 25},
+        {"account": {"domain": {"any": {"include": [domain]}}},
+         "page": 0, "size": 25},
+    ):
+        code, d = req(f"{AIARK}/v1/people", H, body)
+        if code == 200 and isinstance(d, dict):
+            people = d.get("content") or []
+            total = d.get("totalElements", len(people))
+        if people:
+            break
     if not people:
-        return {"aiark_people": 0}
+        return [], 0
 
-    best = sorted(people, key=rank_person)[0]
-    prof = best.get("profile") or {}
-    out = {
-        "aiark_people": d.get("totalElements", len(people)),
-        "aiark_name": prof.get("full_name") or "",
-        "aiark_first": prof.get("first_name") or "",
-        "aiark_last": prof.get("last_name") or "",
-        "aiark_linkedin": (best.get("link") or {}).get("linkedin") or "",
-        "aiark_seniority": (best.get("department") or {}).get("seniority") or "",
-    }
+    # Keep only decision-makers, best title first.
+    ranked = []
+    for p in people:
+        title = person_title(p)
+        hit = classify_title(title)
+        if not hit:
+            continue
+        prof = p.get("profile") or {}
+        ranked.append((hit[0], {
+            "name": prof.get("full_name") or "",
+            "first": prof.get("first_name") or "",
+            "last": prof.get("last_name") or "",
+            "title": title,
+            "title_label": hit[1],
+            "linkedin": (p.get("link") or {}).get("linkedin") or "",
+            "seniority": (p.get("department") or {}).get("seniority") or "",
+            "_id": p.get("id"),
+        }))
+    ranked.sort(key=lambda x: x[0])
 
-    pid = best.get("id")
-    if not pid:
-        return out
-    code, e = req(f"{AIARK}/v2/people/export/single", H, {"id": pid})
-    if code == 200 and isinstance(e, dict):
-        # v2 wraps in {status, error, data}; email at data.email.value
-        data = e.get("data") or e
-        em = data.get("email") or {}
-        addr = em.get("value") or em.get("address") or ""
-        if not addr:
-            outp = em.get("output") or []
-            if outp and isinstance(outp, list):
-                addr = (outp[0] or {}).get("address", "")
-        if addr:
-            out["aiark_email"] = addr
-    return out
+    out = []
+    for _, c in ranked[:want]:
+        if c["_id"]:
+            c["email"] = aiark_email_for(c["_id"], H)
+        out.append(c)
+    return out, total
 
 
 def prospeo_lookup(first, last, domain, linkedin, key):
@@ -216,7 +303,8 @@ def prospeo_lookup(first, last, domain, linkedin, key):
     if addr and "*" in addr:
         return {**extra, "prospeo_masked": addr, "prospeo_status": em.get("status", "")}
     return {**extra, "prospeo_email": addr, "prospeo_status": em.get("status", ""),
-            "prospeo_name": person.get("full_name", "")}
+            "prospeo_name": person.get("full_name", ""),
+            "prospeo_title": person.get("current_job_title", "") or ""}
 
 
 def main():
@@ -267,39 +355,58 @@ def main():
     def work(b):
         pid = b["place_id"]
         e = lp.get(pid, {})
-        rec = {"place_id": pid, "business_name": b["business_name"],
-               "domain": b["domain"], "lp_owner_name": e.get("owner_name", "")}
+        contacts, total = aiark_contacts(b["domain"], H_ark)
 
-        rec.update(aiark_lookup(b["domain"], H_ark))
+        # AI Ark found the person but no address -> Prospeo fills it in.
+        for c in contacts:
+            if not c.get("email"):
+                r = prospeo_lookup(c.get("first", ""), c.get("last", ""),
+                                   b["domain"], c.get("linkedin", ""), pkey)
+                if r.get("prospeo_email"):
+                    c["email"], c["source"] = r["prospeo_email"], "prospeo"
+            elif not c.get("source"):
+                c["source"] = "aiark"
 
-        email = rec.get("aiark_email", "")
-        source = "aiark" if email else ""
-
-        if not email:
-            # Prefer LocalPipe's name (it verified the business), else AI Ark's.
+        # AI Ark had nobody usable -> try Prospeo against the company directly.
+        if not any(c.get("email") for c in contacts):
             lp_name = (e.get("owner_name") or "").strip()
             first = (e.get("owner_first_name") or "").strip()
             last = (e.get("owner_last_name") or "").strip()
-            if not (first and last) and lp_name and len(lp_name.split()) >= 2:
+            if not (first and last) and len(lp_name.split()) >= 2:
                 first, last = lp_name.split()[0], lp_name.split()[-1]
-            if not (first and last):
-                first, last = rec.get("aiark_first", ""), rec.get("aiark_last", "")
-            rec.update(prospeo_lookup(first, last, b["domain"],
-                                      rec.get("aiark_linkedin", ""), pkey))
-            if rec.get("prospeo_email"):
-                email = rec["prospeo_email"]
-                source = "prospeo"
+            r = prospeo_lookup(first, last, b["domain"], "", pkey)
+            if r.get("prospeo_email"):
+                ptitle = r.get("prospeo_title", "")
+                # A name from LocalPipe is already an owner/decision-maker, so
+                # trust it. A blind domain search is not, so it must pass the
+                # title filter or we would ship receptionists as "C-suite".
+                trusted = bool(first and last and lp_name)
+                if trusted or classify_title(ptitle):
+                    contacts.append({
+                        "name": r.get("prospeo_name") or lp_name,
+                        "first": first, "last": last,
+                        "title": ptitle,
+                        "title_label": (classify_title(ptitle) or (None, "Owner"))[1],
+                        "linkedin": "", "seniority": "",
+                        "email": r["prospeo_email"], "source": "prospeo",
+                    })
 
-        rec["final_email"] = email
-        rec["final_source"] = source
+        kept = [c for c in contacts if c.get("email")][:MAX_CONTACTS]
+        rec = {"place_id": pid, "business_name": b["business_name"],
+               "domain": b["domain"], "aiark_people": total,
+               "lp_owner_name": e.get("owner_name", ""),
+               "contacts": kept,
+               "final_email": kept[0]["email"] if kept else "",
+               "final_source": kept[0].get("source", "") if kept else ""}
         with _lock:
             with open(PROG, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
             counter[0] += 1
             n = counter[0]
-        if n % 10 == 0 or email:
-            log(f"  [{n}/{len(targets)}] {b['business_name'][:30]:<30} "
-                f"{source or '-':<8} {email or '-'}")
+        if n % 10 == 0 or kept:
+            who = "; ".join(f"{c['name']} ({c['title_label']})" for c in kept) or "-"
+            log(f"  [{n}/{len(targets)}] {b['business_name'][:26]:<26} "
+                f"{len(kept)} contact(s)  {who[:60]}")
 
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as ex:
         list(ex.map(work, targets))
@@ -314,21 +421,54 @@ def main():
                     recs.append(json.loads(line))
                 except Exception:
                     continue
-    cols = ["place_id", "business_name", "domain", "lp_owner_name",
-            "aiark_people", "aiark_name", "aiark_seniority", "aiark_linkedin",
-            "aiark_email", "prospeo_email", "prospeo_status", "prospeo_error",
-            "final_email", "final_source"]
+    # ONE ROW PER CONTACT: a company with 3 decision-makers produces 3 rows
+    # sharing a place_id, so every row is a single send target.
+    cols = ["place_id", "business_name", "domain", "contact_index",
+            "contact_name", "contact_title", "contact_title_label",
+            "contact_linkedin", "contact_email", "contact_source",
+            "aiark_people", "lp_owner_name"]
+    flat = []
+    for r in recs:
+        cs = r.get("contacts") or []
+        if not cs:
+            flat.append({"place_id": r.get("place_id"),
+                         "business_name": r.get("business_name"),
+                         "domain": r.get("domain"), "contact_index": 0,
+                         "aiark_people": r.get("aiark_people", 0),
+                         "lp_owner_name": r.get("lp_owner_name", "")})
+            continue
+        for i, c in enumerate(cs, 1):
+            flat.append({
+                "place_id": r.get("place_id"),
+                "business_name": r.get("business_name"),
+                "domain": r.get("domain"),
+                "contact_index": i,
+                "contact_name": c.get("name", ""),
+                "contact_title": c.get("title", ""),
+                "contact_title_label": c.get("title_label", ""),
+                "contact_linkedin": c.get("linkedin", ""),
+                "contact_email": c.get("email", ""),
+                "contact_source": c.get("source", ""),
+                "aiark_people": r.get("aiark_people", 0),
+                "lp_owner_name": r.get("lp_owner_name", ""),
+            })
     with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
-        for r in recs:
+        for r in flat:
             w.writerow({c: r.get(c, "") for c in cols})
 
-    n_ark = sum(1 for r in recs if r.get("final_source") == "aiark")
-    n_pro = sum(1 for r in recs if r.get("final_source") == "prospeo")
-    n_any = sum(1 for r in recs if r.get("final_email"))
-    log(f"RESULT  processed {len(recs)}  emails {n_any}  "
-        f"(aiark {n_ark}, prospeo {n_pro})  still empty {len(recs) - n_any}")
+    withc = [r for r in recs if r.get("contacts")]
+    n_contacts = sum(len(r["contacts"]) for r in withc)
+    n_ark = sum(1 for r in withc for c in r["contacts"] if c.get("source") == "aiark")
+    n_pro = sum(1 for r in withc for c in r["contacts"] if c.get("source") == "prospeo")
+    titles = Counter(c.get("title_label", "?") for r in withc for c in r["contacts"])
+    log(f"RESULT  companies {len(recs)}  with contacts {len(withc)}  "
+        f"contacts {n_contacts} (aiark {n_ark}, prospeo {n_pro})  "
+        f"still empty {len(recs) - len(withc)}")
+    log(f"  avg contacts per company found: "
+        f"{n_contacts / len(withc):.2f}" if withc else "  none")
+    log(f"  titles: {dict(titles.most_common())}")
     log(f"Wrote {OUT_CSV}")
     log("DONE")
 

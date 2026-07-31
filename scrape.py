@@ -69,6 +69,28 @@ CITIES_CA = [
     ("Burlington, ON",        43.3255, -79.7990), ("Oshawa, ON",         43.8971, -78.8658),
     ("Windsor, ON",           42.3149, -83.0364), ("St. Catharines, ON", 43.1594, -79.2469),
     ("Victoria, BC",          48.4284, -123.3656),("Barrie, ON",         44.3894, -79.6903),
+    # --- secondary markets and suburbs: where the small operators actually are.
+    # The top-25 results in a big metro are national firms; small contractors
+    # live further down the list and in cities like these.
+    ("Sherbrooke, QC",        45.4042, -71.8929), ("Trois-Rivieres, QC", 46.3432, -72.5432),
+    ("Saguenay, QC",          48.4280, -71.0685), ("Levis, QC",          46.8033, -71.1779),
+    ("Terrebonne, QC",        45.7000, -73.6333), ("Kelowna, BC",        49.8880, -119.4960),
+    ("Abbotsford, BC",        49.0504, -122.3045),("Kamloops, BC",       50.6745, -120.3273),
+    ("Nanaimo, BC",           49.1659, -123.9401),("Chilliwack, BC",     49.1579, -121.9514),
+    ("Coquitlam, BC",         49.2838, -122.7932),("Langley, BC",        49.1044, -122.6604),
+    ("Saanich, BC",           48.4840, -123.3810),("Kingston, ON",       44.2312, -76.4860),
+    ("Guelph, ON",            43.5448, -80.2482), ("Greater Sudbury, ON",46.4917, -80.9930),
+    ("Thunder Bay, ON",       48.3809, -89.2477), ("Waterloo, ON",       43.4643, -80.5204),
+    ("Cambridge, ON",         43.3616, -80.3144), ("Milton, ON",         43.5183, -79.8774),
+    ("Ajax, ON",              43.8509, -79.0204), ("Whitby, ON",         43.8975, -78.9429),
+    ("Pickering, ON",         43.8384, -79.0868), ("Niagara Falls, ON",  43.0896, -79.0849),
+    ("Brantford, ON",         43.1394, -80.2644), ("Peterborough, ON",   44.3091, -78.3197),
+    ("Sarnia, ON",            42.9745, -82.4066), ("Kanata, ON",         45.3088, -75.8987),
+    ("Moncton, NB",           46.0878, -64.7782), ("Saint John, NB",     45.2733, -66.0633),
+    ("Fredericton, NB",       45.9636, -66.6431), ("St. John's, NL",     47.5615, -52.7126),
+    ("Charlottetown, PE",     46.2382, -63.1311), ("Red Deer, AB",       52.2681, -113.8112),
+    ("Lethbridge, AB",        49.6956, -112.8451),("St. Albert, AB",     53.6305, -113.6256),
+    ("Airdrie, AB",           51.2917, -114.0144),
 ]
 
 # Each region gets its own output filename and raw/ cache. Sharing either would
@@ -449,8 +471,48 @@ def scrape_localpipe(key):
     return list(buckets.items())
 
 
+def load_existing_rows(path):
+    """Read a previous export back into the internal row shape.
+
+    Used by --add: rows already exported (and already paid to enrich) are pinned
+    into the new output rather than re-selected, so their place_ids keep linking
+    to existing enrichment results and are never re-charged.
+    """
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            def num(v):
+                try:
+                    return float(v) if v not in (None, "") else None
+                except ValueError:
+                    return None
+            out.append({
+                "name": r.get("business_name"),
+                "_city": r.get("business_location"),
+                "website": r.get("business_website"),
+                "phone_number": r.get("phone"),
+                "full_address": r.get("full_address"),
+                "city": r.get("city"),
+                "state": r.get("state"),
+                "rating": num(r.get("rating")),
+                "review_count": num(r.get("review_count")),
+                "types": [t for t in (r.get("types") or "").split("; ") if t],
+                "is_claimed": r.get("is_claimed"),
+                "verified": r.get("verified"),
+                "place_id": r.get("place_id"),
+                "business_id": r.get("business_id"),
+                "latitude": num(r.get("latitude")),
+                "longitude": num(r.get("longitude")),
+                "is_permanently_closed": False,
+                "is_temporarily_closed": False,
+            })
+    return out
+
+
 def main():
-    global REGION, CITIES, COUNTRY, OUT_PREFIX, RAW, LOG
+    global REGION, CITIES, COUNTRY, OUT_PREFIX, RAW, LOG, TARGET_TOTAL, PER_CITY
     if "--region" in sys.argv:
         REGION = sys.argv[sys.argv.index("--region") + 1].lower()
     if REGION not in REGIONS:
@@ -460,8 +522,19 @@ def main():
     RAW = os.path.join(HERE, "raw", REGION)
     LOG = os.path.join(HERE, f"scrape-{REGION}.log")
 
+    def argval(flag, cast=int):
+        return cast(sys.argv[sys.argv.index(flag) + 1]) if flag in sys.argv else None
+
+    TARGET_TOTAL = argval("--target") or TARGET_TOTAL
+    PER_CITY = argval("--per-city") or PER_CITY
+    # --add N: keep everything already exported and add N NEW businesses on top.
+    add_new = argval("--add")
+
     open(LOG, "w").close()
     log(f"Region: {REGION.upper()}  ({len(CITIES)} cities, country={COUNTRY})")
+    log(f"Depth: limit {PER_CITY}/city  |  "
+        + (f"adding {add_new} NEW rows to the existing export"
+           if add_new else f"target {TARGET_TOTAL} rows"))
     env = load_env()
 
     # Provider selection. ScraperTech is OPTIONAL: with no key, or with
@@ -575,37 +648,59 @@ def main():
     # splitting one 7-location brand into a 5 and a 2. Same for hoffmancorp.com,
     # topnotchbuilders1.com, grandeurhillsgroup.com.
     # Guards: no domain -> singleton; shared site-builder host -> singleton.
-    groups = defaultdict(list)
-    for rows in by_city.values():
-        for r in rows:
-            dom = root_domain(r.get("website"))
-            r["_key"] = dom if dom and dom not in SHARED_HOSTS else None
-            if r["_key"]:
-                groups[r["_key"]].append(r)
+    # --add: pin previously exported rows so they are never dropped, and remove
+    # them from the new-candidate pools so the N we add really are new.
+    pinned = []
+    if add_new:
+        pinned = load_existing_rows(os.path.join(HERE, f"{OUT_PREFIX}.csv"))
+        pinned_ids = {r["place_id"] for r in pinned}
+        before = sum(len(v) for v in by_city.values())
+        for city in by_city:
+            by_city[city] = [r for r in by_city[city]
+                             if r.get("place_id") not in pinned_ids]
+        after = sum(len(v) for v in by_city.values())
+        log(f"--add: pinned {len(pinned)} existing rows; "
+            f"removed {before - after} of them from the new pool; "
+            f"{after} new candidates remain")
 
-    for rows in by_city.values():
-        for r in rows:
-            k = r.get("_key")
-            n = len({x.get("place_id") for x in groups[k]}) if k else 1
-            r["_location_count"] = n
-            r["_is_multi"] = "yes" if n >= 2 else "no"
-            r["_chain_cities"] = "; ".join(sorted({x["_city"] for x in groups[k]})) if k else ""
+    # Chain flags are computed over pinned + new together, so location counts
+    # reflect the whole known set rather than just this batch.
+    all_rows = [r for rows in by_city.values() for r in rows] + pinned
+    groups = defaultdict(list)
+    for r in all_rows:
+        dom = root_domain(r.get("website"))
+        r["_key"] = dom if dom and dom not in SHARED_HOSTS else None
+        if r["_key"]:
+            groups[r["_key"]].append(r)
+
+    for r in all_rows:
+        k = r.get("_key")
+        n = len({x.get("place_id") for x in groups[k]}) if k else 1
+        r["_location_count"] = n
+        r["_is_multi"] = "yes" if n >= 2 else "no"
+        r["_chain_cities"] = "; ".join(sorted({x["_city"] for x in groups[k]})) if k else ""
 
     multi = sum(1 for v in by_city.values() for r in v if r["_is_multi"] == "yes")
     log(f"Multi-location flagged: {multi} rows across "
         f"{len([k for k, v in groups.items() if len({x['place_id'] for x in v}) >= 2])} brands")
 
     # ---------- round-robin truncate to TARGET_TOTAL (even city spread) ----------
-    final, i = [], 0
+    want = add_new if add_new else TARGET_TOTAL
+    picked, i = [], 0
     pools = list(by_city.values())
-    while len(final) < TARGET_TOTAL and any(len(p) > i for p in pools):
+    while len(picked) < want and any(len(p) > i for p in pools):
         for p in pools:
             if i < len(p):
-                final.append(p[i])
-                if len(final) >= TARGET_TOTAL:
+                picked.append(p[i])
+                if len(picked) >= want:
                     break
         i += 1
-    log(f"Final rows after round-robin cap: {len(final)}")
+    if add_new and len(picked) < want:
+        log(f"  WARNING: only {len(picked)} new businesses available, wanted {want}. "
+            f"Raise --per-city or add more cities.")
+    final = pinned + picked
+    log(f"Selected: {len(picked)} new"
+        + (f" + {len(pinned)} pinned = {len(final)} total" if pinned else ""))
 
     # ---------- write CSV ----------
     out = os.path.join(HERE, f"{OUT_PREFIX}.csv")
@@ -645,8 +740,13 @@ def main():
     problems = []
     if len(set(pids)) != len(pids):
         problems.append(f"duplicate place_ids: {len(pids) - len(set(pids))}")
-    if len(final) > TARGET_TOTAL:
-        problems.append(f"row count {len(final)} exceeds cap {TARGET_TOTAL}")
+    cap = (len(pinned) + add_new) if add_new else TARGET_TOTAL
+    if len(final) > cap:
+        problems.append(f"row count {len(final)} exceeds cap {cap}")
+    if add_new and pinned:
+        lost = {r["place_id"] for r in pinned} - set(pids)
+        if lost:
+            problems.append(f"{len(lost)} previously exported rows went missing")
     if any(not root_domain(r.get("website")) for r in final):
         problems.append("rows without a website survived the filter")
     log(f"Cities represented in final CSV: "
