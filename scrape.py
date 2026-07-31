@@ -685,6 +685,25 @@ def main():
         f"{len([k for k, v in groups.items() if len({x['place_id'] for x in v}) >= 2])} brands")
 
     # ---------- round-robin truncate to TARGET_TOTAL (even city spread) ----------
+    # Franchises are excluded by default. Every branch shares one website, and
+    # all enrichment providers key on the domain, so branches resolve to the same
+    # one or two people: measured, 6 alairhomes.ca locations returned 1 distinct
+    # email. They are also the wrong prospect -- head office is not the buyer.
+    # --keep-chains restores them.
+    if "--keep-chains" not in sys.argv:
+        dropped_chain = 0
+        for city in by_city:
+            keep = []
+            for r in by_city[city]:
+                if r.get("_is_multi") == "yes":
+                    dropped_chain += 1
+                    continue
+                keep.append(r)
+            by_city[city] = keep
+        if dropped_chain:
+            log(f"Franchise filter: dropped {dropped_chain} multi-location rows "
+                f"(--keep-chains to keep them)")
+
     want = add_new if add_new else TARGET_TOTAL
     picked, i = [], 0
     pools = list(by_city.values())
