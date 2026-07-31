@@ -49,6 +49,28 @@ CITIES_US = [
     ("El Paso, TX",           31.7587, -106.4869),("Boston, MA",        42.3584, -71.0598),
     ("Portland, OR",          45.5234, -122.6762),("Detroit, MI",       42.3314, -83.0457),
     ("Las Vegas, NV",         36.1750, -115.1372),("New South Memphis, TN", 35.0868, -90.0568),
+    # --- secondary markets and suburbs: where the small operators actually are.
+    ("Louisville, KY",        38.2527, -85.7585), ("Baltimore, MD",      39.2904, -76.6122),
+    ("Milwaukee, WI",         43.0389, -87.9065), ("Albuquerque, NM",    35.0844, -106.6504),
+    ("Tucson, AZ",            32.2226, -110.9747),("Fresno, CA",         36.7378, -119.7871),
+    ("Sacramento, CA",        38.5816, -121.4944),("Kansas City, MO",    39.0997, -94.5786),
+    ("Mesa, AZ",              33.4152, -111.8315),("Atlanta, GA",        33.7490, -84.3880),
+    ("Omaha, NE",             41.2565, -95.9345), ("Colorado Springs, CO",38.8339,-104.8214),
+    ("Raleigh, NC",           35.7796, -78.6382), ("Virginia Beach, VA", 36.8529, -75.9780),
+    ("Long Beach, CA",        33.7701, -118.1937),("Oakland, CA",        37.8044, -122.2712),
+    ("Minneapolis, MN",       44.9778, -93.2650), ("Tulsa, OK",          36.1540, -95.9928),
+    ("Bakersfield, CA",       35.3733, -119.0187),("Wichita, KS",        37.6872, -97.3301),
+    ("Aurora, CO",            39.7294, -104.8319),("Tampa, FL",          27.9506, -82.4572),
+    ("New Orleans, LA",       29.9511, -90.0715), ("Cleveland, OH",      41.4993, -81.6944),
+    ("Anaheim, CA",           33.8366, -117.9143),("Lexington, KY",      38.0406, -84.5037),
+    ("Riverside, CA",         33.9806, -117.3755),("Newark, NJ",         40.7357, -74.1724),
+    ("Saint Paul, MN",        44.9537, -93.0900), ("Cincinnati, OH",     39.1031, -84.5120),
+    ("Orlando, FL",           28.5383, -81.3792), ("Pittsburgh, PA",     40.4406, -79.9959),
+    ("St. Louis, MO",         38.6270, -90.1994), ("Greensboro, NC",     36.0726, -79.7920),
+    ("Buffalo, NY",           42.8864, -78.8784), ("Boise, ID",          43.6150, -116.2023),
+    ("Salt Lake City, UT",    40.7608, -111.8910),("Richmond, VA",       37.5407, -77.4360),
+    ("Des Moines, IA",        41.5868, -93.6250), ("Spokane, WA",        47.6588, -117.4260),
+    ("Baton Rouge, LA",       30.4515, -91.1871), ("Birmingham, AL",     33.5186, -86.8104),
 ]
 
 # All of Canada is west of Greenwich, so every longitude here is negative too.
@@ -529,6 +551,11 @@ def main():
     PER_CITY = argval("--per-city") or PER_CITY
     # --add N: keep everything already exported and add N NEW businesses on top.
     add_new = argval("--add")
+    # --exclude PATH: drop any business already present in that CSV, WITHOUT
+    # carrying its rows into the output. Use when starting a list afresh but the
+    # previous batch is already loaded elsewhere and must not be duplicated.
+    exclude_path = (sys.argv[sys.argv.index("--exclude") + 1]
+                    if "--exclude" in sys.argv else None)
 
     open(LOG, "w").close()
     log(f"Region: {REGION.upper()}  ({len(CITIES)} cities, country={COUNTRY})")
@@ -685,6 +712,33 @@ def main():
         f"{len([k for k, v in groups.items() if len({x['place_id'] for x in v}) >= 2])} brands")
 
     # ---------- round-robin truncate to TARGET_TOTAL (even city spread) ----------
+    # --exclude: remove businesses already delivered in a previous batch, by
+    # place_id AND by domain (the same firm can surface under a new place_id
+    # after a re-scrape, which would still ship as a duplicate downstream).
+    if exclude_path:
+        ex_pids, ex_doms = set(), set()
+        with open(exclude_path, encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                if r.get("place_id"):
+                    ex_pids.add(r["place_id"])
+                if r.get("domain"):
+                    ex_doms.add(r["domain"].strip().lower())
+        removed_pid = removed_dom = 0
+        for city in by_city:
+            keep = []
+            for r in by_city[city]:
+                if r.get("place_id") in ex_pids:
+                    removed_pid += 1
+                    continue
+                if root_domain(r.get("website")) in ex_doms:
+                    removed_dom += 1
+                    continue
+                keep.append(r)
+            by_city[city] = keep
+        log(f"--exclude {os.path.basename(exclude_path)}: removed {removed_pid} by "
+            f"place_id and {removed_dom} by domain "
+            f"({len(ex_pids)} prior businesses, {len(ex_doms)} prior domains)")
+
     # Franchises are excluded by default. Every branch shares one website, and
     # all enrichment providers key on the domain, so branches resolve to the same
     # one or two people: measured, 6 alairhomes.ca locations returned 1 distinct

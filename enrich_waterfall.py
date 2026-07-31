@@ -264,6 +264,21 @@ def aiark_contacts(domain, H, want=MAX_CONTACTS):
         }))
     ranked.sort(key=lambda x: x[0])
 
+    # AI Ark holds duplicate profile records for the same human -- observed
+    # "Lee Stahl (CEO); Lee Stahl (Owner)" and "Gary Hobbs (CEO); Gary Hobbs
+    # (CEO)" on one company. Collapse by name BEFORE fetching emails, so we do
+    # not pay twice for one person and never ship them twice. Sorted best-title
+    # first, so the survivor keeps the most senior title.
+    seen_names, unique = set(), []
+    for rank, c in ranked:
+        key = re.sub(r"[^a-z]", "", (c.get("name") or "").lower())
+        if key and key in seen_names:
+            continue
+        if key:
+            seen_names.add(key)
+        unique.append((rank, c))
+    ranked = unique
+
     out = []
     for _, c in ranked[:want]:
         if c["_id"]:
